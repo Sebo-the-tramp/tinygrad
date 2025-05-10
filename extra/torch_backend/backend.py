@@ -260,6 +260,24 @@ def select_backward(grad_out, input_sizes, dim, index):
   grad_input[slices] = unwrap(grad_out)
   return wrap(grad_input)
 
+# START added these functions for hlb-CIFAR10
+@torch.library.impl("aten::unfold", "privateuseone")
+def unfold(x: torch.Tensor, dim: int, size: int=2, step: int=1):
+    x_ = unwrap(x)
+    kernel_ = [size] + [1]*(x_.ndim - dim - 1)
+    stride_  = [step] + [1]*(x_.ndim - dim - 1)
+    y = x_._pool(k_=kernel_, stride=stride_)        # shape: old_dims + out + all kernels
+    idx = [slice(None)]*(x_.ndim + len(kernel_))    # keep old dims and the first kernel axis
+    idx[x_.ndim+1:] = [0]*(len(kernel_)-1)          # drop the 1-sized kernel axes after it
+    return wrap(y[idx]) 
+
+@torch.library.impl("aten::_linalg_eigh", "privateuseone")
+def _linalg_eigh(tensor, UPLO="L"):
+    print(tensor)
+    return None
+
+# END added these functions for hlb-CIFAR10
+
 def avg_pool(self, kernel_size, stride=[], padding=0, ceil_mode=False, count_include_pad=True, divisor_override=None):
   return wrap(unwrap(self).avg_pool2d(kernel_size, stride if stride != [] else None, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad))
 
@@ -561,7 +579,10 @@ tiny_backend = {**{k:wrap_out(v) for k,v in tiny_backend_out.items()}, **{
   "aten.ones_like": lambda self, dtype=None, device=None, **kwargs:
     self.ones_like(**{k: v for k, v in {"dtype": _from_torch_dtype(dtype) if dtype else None,
                                         "device": _from_torch_device(device) if device else None}.items() if v is not None}),
-  "aten.max.dim": lambda self, dim, keepdim=False: (self.max(dim, keepdim), self.argmax(dim, keepdim).cast(dtype=dtypes.int64))
+  "aten.max.dim": lambda self, dim, keepdim=False: (self.max(dim, keepdim), self.argmax(dim, keepdim).cast(dtype=dtypes.int64)),
+
+  # new things needed for hlb
+  # "aten.unfold": lambda self, dim: self.unfold(dim)
 }}
 
 def wrap_fxn(k,f):
