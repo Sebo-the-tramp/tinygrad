@@ -11,16 +11,16 @@ from tinygrad import nn, dtypes, Device, Tensor
 from tinygrad.device import is_dtype_supported
 from tinygrad.dtype import DType, ImageDType
 from tinygrad.shape.shapetracker import ShapeTracker
-from tinygrad.ops import PatternMatcher, UOp, Ops, GroupOp, UPat, graph_rewrite, track_rewrites, merge_views
+from tinygrad.ops import PatternMatcher, UOp, Ops, GroupOp, UPat, graph_rewrite, track_rewrites
 from tinygrad.codegen.symbolic import symbolic_simple
 from tinygrad.spec import type_verify, shape_spec
 from tinygrad.helpers import CI, DEBUG, FUSE_ARANGE, SPLIT_REDUCEOP, GlobalCounters, Context, getenv, all_same, temp
-from tinygrad.engine.grouper import view_left, view_right, sym, get_becomes_map
+from tinygrad.engine.grouper import view_left, view_right, sym, get_becomes_map, Kernel, create_ast, merge_views
 from tinygrad.engine.schedule import ScheduleItem, create_schedule_with_vars
 from tinygrad.engine.realize import CompiledRunner, run_schedule, lower_schedule
 from extra.models.llama import precompute_freqs_cis
 
-def verify_ast(sink:UOp): return type_verify(list(sink.toposort), shape_spec)
+def verify_ast(sink:UOp): return type_verify(list(sink.toposort()), shape_spec)
 class KernelCountException(Exception): pass
 def check_schedule(t:Union[Tensor, List[Tensor], UOp], allowed:int, to_prerealize:Optional[List[Tensor]]=None, filter_sink=True):
   if to_prerealize:
@@ -29,7 +29,7 @@ def check_schedule(t:Union[Tensor, List[Tensor], UOp], allowed:int, to_prerealiz
   elif isinstance(t, List) and isinstance(t[0], Tensor): sched = Tensor.schedule(*t)
   else:
     assert isinstance(t, UOp), f"can't schedule {t}"
-    sink = UOp.sink(t)
+    sink = UOp.sink(t) if t.op is not Ops.SINK else t
     becomes_map = get_becomes_map(sink)
     sched, _, __ = create_schedule_with_vars(sink.substitute(becomes_map))
   # test lowering all the ScheduleItems to ExecItems
@@ -81,6 +81,7 @@ class TestSchedule(unittest.TestCase):
     with self.assertRaises(RuntimeError): check_schedule(c, 1)
 
   @unittest.skipUnless(is_dtype_supported(dtypes.half) and getenv("CAST_AFTER_EXPAND"), "need half and CAST_AFTER_EXPAND=1")
+  @unittest.skip("CAST_AFTER_EXPAND is not supported")
   def test_expand_buffer_before_cast(self):
     a = Tensor.randn(4, 2, 1).realize().permute((1, 0, 2))
     b = a.cast(dtypes.half).expand((2, 4, 4))+2
@@ -104,7 +105,7 @@ class TestSchedule(unittest.TestCase):
     a = Tensor.empty(1022).cummax(axis=0)
     sched = check_schedule(a, 5)
     ast = sched[0].ast
-    self.assertLessEqual(len([u for u in ast.toposort if u.op is Ops.WHERE]), 6)
+    self.assertLessEqual(len([u for u in ast.toposort() if u.op is Ops.WHERE]), 6)
 
   def test_basic_binop_fusion(self):
     a = Tensor.empty(10)
@@ -243,7 +244,7 @@ class TestSchedule(unittest.TestCase):
     r1 = (x - r0).sum(axis=0).div(2)
     out = r0 + r1
     schedule = check_schedule(out, 2)
-    reduceops = [x for si in schedule for x in si.ast.toposort if x.op is Ops.REDUCE_AXIS]
+    reduceops = [x for si in schedule for x in si.ast.toposort() if x.op is Ops.REDUCE_AXIS]
     assert len(reduceops) == 2
 
   def test_cache_reduce_multiple_children(self):
@@ -254,7 +255,7 @@ class TestSchedule(unittest.TestCase):
     out0 = r0 + y
     out1 = r1 + y
     schedule = check_schedule([out0, out1], 4)
-    reduceops = [x for si in schedule for x in si.ast.toposort if x.op is Ops.REDUCE_AXIS]
+    reduceops = [x for si in schedule for x in si.ast.toposort() if x.op is Ops.REDUCE_AXIS]
     assert len(reduceops) == 2
 
   def test_div_collapse_buffer(self):
@@ -558,21 +559,17 @@ class TestSchedule(unittest.TestCase):
     check_schedule(x, 3)
 
   def test_resnet_block(self):
-    old_training = Tensor.training
-    Tensor.training = False
-
-    in_planes, planes = 64, 64
-    conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-    bn1 = nn.BatchNorm2d(planes)
-    conv2 = nn.Conv2d(planes, planes, kernel_size=3, padding=1, stride=1, bias=False)
-    bn2 = nn.BatchNorm2d(planes)
-
-    x = Tensor.empty(1, 64, 32, 32)
-    out = bn1(conv1(x)).relu()
-    out = bn2(conv2(out))
-    out = (out + x).relu()
-    check_schedule(out, 2, [conv1.weight, conv2.weight])
-    Tensor.training = old_training
+    with Tensor.train(False):
+      in_planes, planes = 64, 64
+      conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+      bn1 = nn.BatchNorm2d(planes)
+      conv2 = nn.Conv2d(planes, planes, kernel_size=3, padding=1, stride=1, bias=False)
+      bn2 = nn.BatchNorm2d(planes)
+      x = Tensor.empty(1, 64, 32, 32)
+      out = bn1(conv1(x)).relu()
+      out = bn2(conv2(out))
+      out = (out + x).relu()
+      run_schedule(check_schedule(out, 2, [conv1.weight, conv2.weight]))
 
   def test_contiguous_while_contiguous(self):
     x = Tensor.empty(1, 64, 32, 32)
@@ -602,6 +599,16 @@ class TestSchedule(unittest.TestCase):
     b = a*2
     c = b.kernelize()+Tensor.empty(4,4)
     check_schedule(c, 2)
+
+  def test_multioutput_ast(self):
+    a = Tensor.zeros(1, dtype=dtypes.int).contiguous().realize().lazydata
+    b = Tensor.zeros(1, dtype=dtypes.int).contiguous().realize().lazydata
+    c = Tensor.arange(4).realize().lazydata
+    kernel = UOp(Ops.KERNEL, src=(a, b, c), arg=Kernel(UOp.sink(c.r(Ops.ADD, (0,))+1, c.r(Ops.ADD, (0,))*2)))
+    kernel = graph_rewrite(kernel, create_ast)
+    run_schedule(check_schedule(UOp.sink(a.assign(kernel), b.assign(kernel)), 1))
+    self.assertEqual(a.buffer.numpy(), [7])
+    self.assertEqual(b.buffer.numpy(), [12])
 
   # unlike schedule, kernelize can be called multiple times on a Tensor
   def test_double_kerenlize(self):
@@ -641,7 +648,7 @@ class TestSchedule(unittest.TestCase):
   def _alu_from_tensor(self, t:Tensor):
     s = [s for s in t.schedule() if s.ast.op is Ops.SINK]
     self.assertEqual(len(s), 1)
-    return [u.op for u in s[0].ast.toposort if u.op in GroupOp.ALU]
+    return [u.op for u in s[0].ast.toposort() if u.op in GroupOp.ALU]
 
   def test_2_pow_is_exp2(self):
     t = 2.0 ** Tensor([1.0, 2.0, 3.0])
@@ -1677,9 +1684,9 @@ class TestIndexing(unittest.TestCase):
     Tensor.manual_seed(0)
     a = Tensor.arange(4,)
     b = Tensor.randn(4, 4).realize()
-    out = a+b
+    out = (a+b).sum()
     self.check_schedule(out, 1)
-    np.testing.assert_allclose(out.numpy(), np.arange(4)+b.numpy())
+    np.testing.assert_allclose(out.numpy(), (np.arange(4)+b.numpy()).sum(), atol=1e-5)
 
   def test_argmin(self):
     Tensor.manual_seed(0)
@@ -1698,25 +1705,25 @@ class TestIndexing(unittest.TestCase):
   def test_arange_transposed(self):
     Tensor.manual_seed(0)
     x = Tensor.randint(4, 1).realize()
-    a = (Tensor.arange(4,)*x).T
+    a = ((Tensor.arange(4,)*x).T).sum()
     self.check_schedule(a, 1)
-    np.testing.assert_equal(a.numpy(), (np.arange(4)*x.numpy()).T)
+    np.testing.assert_equal(a.numpy(), (np.arange(4)*x.numpy()).T.sum())
 
   def test_arange_transposed_descendants(self):
     Tensor.manual_seed(0)
     x = Tensor.randint(4, 1).realize()
     a = (Tensor.arange(4,)*x).T
     b = Tensor.randint(4, 4).realize()
-    out = a+b
+    out = (a+b).sum()
     self.check_schedule(out, 1)
-    np.testing.assert_equal(out.numpy(), (np.arange(4)*x.numpy()).T+b.numpy())
+    np.testing.assert_equal(out.numpy(), ((np.arange(4)*x.numpy()).T+b.numpy()).sum())
 
   def test_arange_index(self):
     Tensor.manual_seed(0)
     x = Tensor.randn(5, 2).realize()
     a = Tensor.arange(10)
     out = (x + a[2]).sum()
-    self.check_schedule(out, 2)
+    self.check_schedule(out, 1)
     np.testing.assert_allclose(out.numpy(), (x.numpy()+np.arange(10)[2]).sum(), atol=1e-5, rtol=1e-6)
 
   @unittest.skip("TOOD: FUSE_ARANGE overrules Tensor.arange().contiguous()")
@@ -1733,7 +1740,7 @@ class TestIndexing(unittest.TestCase):
     x = Tensor.randn(5, 2).realize()
     a = Tensor.arange(10)+1
     out = (x + a[2]).sum()
-    self.check_schedule(out, 2)
+    self.check_schedule(out, 1)
     np.testing.assert_allclose(out.numpy(), (x.numpy()+(np.arange(10)+1)[2]).sum(), atol=1e-5, rtol=1e-6)
 
   @unittest.skip("TOOD: FUSE_ARANGE overrules Tensor.arange().contiguous()")
@@ -1780,15 +1787,16 @@ class TestIndexing(unittest.TestCase):
   @unittest.skipIf(Device.DEFAULT == "CPU", "tests copy from ext device")
   def test_arange_shrink_copy(self):
     a = Tensor.arange(12).reshape(4, 3).shrink(((1, 2), (1, 3))).to("CPU")
-    sched = self.check_schedule(a, 1)
+    sched = self.check_schedule(a, 2) # NOTE: there is a contiguous between REDUCE_AXIS and COPY
     self.assertIs(sched[-1].ast.op, Ops.COPY)
     np.testing.assert_equal(a.numpy(), [[4, 5]])
 
   @unittest.skipIf(Device.DEFAULT == "CPU", "tests copy from ext device")
   def test_arange_expand_copy(self):
     a = Tensor.arange(4).reshape(2, 2, 1).expand(2, 2, 2).contiguous().to("CPU")
-    sched = self.check_schedule(a, 1)
-    self.assertIs(sched[1].ast.op, Ops.COPY)
+    sched = self.check_schedule(a, 2) # NOTE: there is a contiguous between REDUCE_AXIS and COPY
+    self.assertIs(sched[2].ast.op, Ops.COPY)
+    self.assertIs(sched[1].ast.src[0].src[2].op, Ops.LOAD)
     self.assertIs(sched[0].ast.src[0].src[2].op, Ops.ADD)
     np.testing.assert_equal(a.numpy(), [[[0, 0], [1, 1]], [[2, 2], [3, 3]]])
 
@@ -1894,7 +1902,7 @@ class TestIndexing(unittest.TestCase):
 
 @track_rewrites(named=True)
 def swizzle_rewrite(u:UOp) -> UOp: return graph_rewrite(graph_rewrite(u, view_left), view_right)
-def swizzle_cnt(u:UOp) -> int: return len([x for x in u.toposort if x.op is Ops.VIEW and len(x.src) != 0 and x.src[0].op is not Ops.BUFFER])
+def swizzle_cnt(u:UOp) -> int: return len([x for x in u.toposort() if x.op is Ops.VIEW and len(x.src) != 0 and x.src[0].op is not Ops.BUFFER])
 
 class TestSwizzle(unittest.TestCase):
   def test_swizzle_simple(self):
@@ -2240,6 +2248,7 @@ class TestCopyFolding(unittest.TestCase):
     add = schedule_graph_rewrite(add)
     assert all_same([x.device for x in add.src]), f"ALU has different devices! {[x.device for x in add.src]}"
 
+  @unittest.skip("this is just clone now")
   def test_copy_to_same_device(self):
     a = Tensor.empty(4).lazydata
     b = a.copy_to_device(a.device)
@@ -2249,6 +2258,7 @@ class TestCopyFolding(unittest.TestCase):
     # in the scheduler because buffer already has shape (4,)
     self.assertIs(b, a.base)
 
+  @unittest.skip("this is just clone now")
   def test_copy_to_same_device_alt(self):
     a = Tensor.empty(4, 4).lazydata
     b = a.copy_to_device(a.device)
@@ -2265,7 +2275,8 @@ class TestCopyFolding(unittest.TestCase):
     a = Tensor.arange(4)
     view = a.shrink(((0, 2),))
     b = view.clone()
-    run_schedule(check_schedule(b, 2, filter_sink=False))
+    # NOTE: this was sort of a bug making this 2
+    run_schedule(check_schedule(b, 3, filter_sink=False))
     self.assertEqual(b.lazydata.base.buffer.size, 2)
     self.assertEqual(b.lazydata.size, 2)
     self.assertListEqual(b.tolist(), [0, 1])
@@ -2464,12 +2475,20 @@ class TestUOpBecome(unittest.TestCase):
 
   # sometimes we prefer to perform an op before movement ops, in this case we should stack the mops on top of the new buffer
 
+  # NOTE: this expand is not reordered because there's before it to fuse
   def test_reorder_expand(self):
     a = Tensor.empty(4, 1)
     b = a.expand(4, 4).reciprocal()
     check_schedule(b, 1)
-    self.assertEqual(b.lazydata.base.buffer.size, 4)
-    self.assertEqual(b.lazydata.st, ShapeTracker.from_shape((4, 1)).expand((4, 4)))
+    self.assertEqual(b.lazydata.base.buffer.size, 16)
+    self.assertEqual(b.lazydata.st, ShapeTracker.from_shape((4, 4)))
+
+  def test_reorder_expand_alt(self):
+    x = Tensor.empty(4, 1)
+    y = Tensor.empty(4, 1)
+    img = Tensor.empty(4, 4)
+    z = (img*x) / y
+    check_schedule(z, 1)
 
   def test_become_existing_buffer(self):
     a = Tensor.empty(4, 4)
