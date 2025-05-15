@@ -18,7 +18,6 @@ from tinygrad.helpers import CI, DEBUG, FUSE_ARANGE, SPLIT_REDUCEOP, GlobalCount
 from tinygrad.engine.grouper import view_left, view_right, sym, get_becomes_map, Kernel, create_ast, merge_views
 from tinygrad.engine.schedule import ScheduleItem, create_schedule_with_vars
 from tinygrad.engine.realize import CompiledRunner, run_schedule, lower_schedule
-from extra.models.llama import precompute_freqs_cis
 
 def verify_ast(sink:UOp): return type_verify(list(sink.toposort()), shape_spec)
 class KernelCountException(Exception): pass
@@ -1647,12 +1646,12 @@ class TestIndexing(unittest.TestCase):
     self.check_schedule(xt, 2)
     np.testing.assert_equal(xt.numpy(), X.numpy()[idxs.numpy()])
 
-  @unittest.skip("TODO: support pads in graph_rewrite")
   def test_simple_indexing_alt(self):
     X = Tensor.arange(16).reshape(4, 4)
     xt = X[[1, 2], [1, 2]]
-    self.check_schedule(xt, 3)
-    np.testing.assert_equal(xt.numpy(), (np.arange(16).reshape(4, 4))[[1, 2], [1, 2]])
+    with self.assertRaisesRegex(RuntimeError, "UOp verification failed"):
+      self.check_schedule(xt, 3)
+      np.testing.assert_equal(xt.numpy(), (np.arange(16).reshape(4, 4))[[1, 2], [1, 2]])
 
   def test_advanced_indexing(self):
     X = Tensor.arange(10)+1
@@ -1667,11 +1666,11 @@ class TestIndexing(unittest.TestCase):
     self.check_schedule(xt, 6)
     np.testing.assert_equal(xt.numpy(), 6)
 
-  @unittest.skip("TODO: break the schedule if dims don't match")
   def test_advanced_simple_indexing_combined(self):
     X = Tensor.arange(16).reshape(4, 4)
     xt = X[1:2, [1, 2]]
-    self.check_schedule(xt, 2)
+    with self.assertRaisesRegex(RuntimeError, "UOp verification failed"):
+      self.check_schedule(xt, 2)
 
   def test_push_through_reshape(self):
     Tensor.manual_seed(0)
@@ -1709,6 +1708,13 @@ class TestIndexing(unittest.TestCase):
     self.check_schedule(a, 1)
     np.testing.assert_equal(a.numpy(), (np.arange(4)*x.numpy()).T.sum())
 
+  def test_div_padded_arange(self):
+    x = Tensor.full((2,2), 16)
+    y = x.idiv(Tensor.linspace(2, 8, steps=4, dtype=dtypes.int).reshape(2,2)).pad(((1,1), (1,1)))
+    out = y.sum(axis=1)
+    with Context(FUSE_ARANGE=1): run_schedule(check_schedule(out, 2))
+    self.assertListEqual(out.tolist(), [0, 12, 4, 0])
+
   def test_arange_transposed_descendants(self):
     Tensor.manual_seed(0)
     x = Tensor.randint(4, 1).realize()
@@ -1726,7 +1732,14 @@ class TestIndexing(unittest.TestCase):
     self.check_schedule(out, 1)
     np.testing.assert_allclose(out.numpy(), (x.numpy()+np.arange(10)[2]).sum(), atol=1e-5, rtol=1e-6)
 
-  @unittest.skip("TOOD: FUSE_ARANGE overrules Tensor.arange().contiguous()")
+  def test_arange_index_shrink(self):
+    Tensor.manual_seed(0)
+    with Context(TRACK_MATCH_STATS=0):
+      x = Tensor.randn(11).realize()
+    a = Tensor.arange(22)
+    out = (x + a[:11]).sum()
+    self.check_schedule(out, 1)
+
   def test_arange_index_contiguous(self):
     Tensor.manual_seed(0)
     x = Tensor.randn(5, 2).realize()
@@ -1743,7 +1756,6 @@ class TestIndexing(unittest.TestCase):
     self.check_schedule(out, 1)
     np.testing.assert_allclose(out.numpy(), (x.numpy()+(np.arange(10)+1)[2]).sum(), atol=1e-5, rtol=1e-6)
 
-  @unittest.skip("TOOD: FUSE_ARANGE overrules Tensor.arange().contiguous()")
   def test_arange_index_contiguous_child(self):
     Tensor.manual_seed(0)
     x = Tensor.randn(5, 2).realize()
@@ -1776,7 +1788,6 @@ class TestIndexing(unittest.TestCase):
     a[0] = 6
     np.testing.assert_equal(a.numpy(), [6., 2., 3., 4.])
 
-  #@unittest.skipUnless(Device.DEFAULT in view_supported_devices, "need view")
   @unittest.skip("BUFFER_VIEW no longer supported on non-disk devices")
   def test_arange_view_op(self):
     a = Tensor.arange(12).reshape(4, 3).shrink(((1, 2), (1, 3))).contiguous()
@@ -1800,18 +1811,18 @@ class TestIndexing(unittest.TestCase):
     self.assertIs(sched[0].ast.src[0].src[2].op, Ops.ADD)
     np.testing.assert_equal(a.numpy(), [[[0, 0], [1, 1]], [[2, 2], [3, 3]]])
 
-  @unittest.skip("TODO: support pads in graph_rewrite")
-  #@unittest.skipUnless(is_dtype_supported(dtypes.half), "need half")
+  @unittest.skipUnless(is_dtype_supported(dtypes.half), "need half")
   def test_precompute_freqs_cis(self):
-    args = {"dim":32 if CI else 128, "end":2048 if CI else 8192, "theta":10000, "dtype":dtypes.half}
+    from extra.models.llama import precompute_freqs_cis
+    args = {"dim":32 if CI else 128, "end":2048 if CI else 8192, "theta":10000}
     fused = precompute_freqs_cis(**args)
-    self.check_schedule(fused, 1)
+    with Context(FUSE_ARANGE=1):
+      run_schedule(check_schedule(fused, 5)) # TODO: this is too many
     if getenv("CHECK", 1):
       ref = precompute_freqs_cis(**args)
-      run_schedule(check_schedule(ref, 3))
+      run_schedule(check_schedule(ref, 5))
       np.testing.assert_equal(fused.numpy(), ref.numpy())
 
-  @unittest.skip("TOOD: FUSE_ARANGE overrules this contiguous")
   def test_fuse_assign_contiguous(self):
     x = Tensor.zeros(4, 4, dtype=dtypes.int).contiguous().realize()
     a = Tensor.arange(8).reshape(4, 2)
@@ -1859,12 +1870,11 @@ class TestIndexing(unittest.TestCase):
     np.testing.assert_allclose(out0.numpy(), r_ref+2, rtol=2e-7)
     np.testing.assert_allclose(out1.numpy(), r_ref+3, rtol=2e-7)
 
-  @unittest.expectedFailure
-  def test_fold_arange_view(self):
+  def test_dont_fold_arange_contiguous_view(self):
     X = Tensor.randn(4, 4).realize()
     r = (X+Tensor.arange(16).reshape(4, 4).contiguous()).sum(1, keepdim=True)
-    self.check_schedule([r], 1)
-    np.testing.assert_allclose(r.numpy(), (X.numpy()+np.arange(16).reshape(4, 4)).sum(1, keepdims=True))
+    self.check_schedule([r], 2)
+    np.testing.assert_allclose(r.numpy(), (X.numpy()+np.arange(16).reshape(4, 4)).sum(1, keepdims=True), atol=1e-5, rtol=1e-6)
 
   @unittest.skip("multi output isn't supported")
   def test_multiview_arange_children(self):
@@ -2000,12 +2010,9 @@ class TestSwizzle(unittest.TestCase):
   def test_unsafe_pad(self):
     x = Tensor.full((2,2), 1.0).contiguous()
     y = x*x.sum((1,)).reciprocal()
-    t = y.pad(((0,1),None)).contiguous()
-    swizzled = swizzle_rewrite(t.lazydata)
-    sched = check_schedule(swizzled, 3)
-    output_buffer = sched[-1].bufs[0]
-    run_schedule(sched)
-    self.assertListEqual(output_buffer.as_buffer().cast("f").tolist(), [0.5, 0.5, 0.5, 0.5, 0., 0.])
+    t = y.pad(((0,1),None))
+    run_schedule(check_schedule(t, 3))
+    np.testing.assert_equal(t.numpy(), [[0.5, 0.5], [0.5, 0.5], [0., 0.]])
 
 def store_val(si:ScheduleItem): return si.ast.src[0].src[2]
 zero_pm = UPat(Ops.CONST, arg=0)

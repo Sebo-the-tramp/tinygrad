@@ -2,7 +2,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from tinygrad.ops import UOp, Ops, GroupOp, PatternMatcher, UPat, graph_rewrite, graph_rewrite_map, identity_element, resolve
 from tinygrad.ops import can_pad, sint, track_rewrites, _substitute
-from tinygrad.codegen.lowerer import get_contraction_with_reduce
+from tinygrad.codegen.lowerer import get_contraction_with_reduce, get_contraction
 from tinygrad.codegen.symbolic import symbolic_simple
 from tinygrad.helpers import Metadata, all_int, all_same, colored, prod, dedup, unwrap, getenv, pluralize, ContextVar, Context, diskcache_put
 from tinygrad.helpers import FUSE_CONV_BW, FUSE_ARANGE, DEBUG, DONT_REALIZE_EXPAND, DONT_GROUP_REDUCES, SPLIT_REDUCEOP, CAPTURE_PROCESS_REPLAY
@@ -84,8 +84,9 @@ sym = symbolic_simple+PatternMatcher([
   # COPY(CONST) creates a new CONST on the destination device
   (UPat(Ops.COPY, name="root", src=(UPat.cvar("x"), UPat(Ops.DEVICE))), lambda root,x: root.const_like(x.arg)),
   # store a shrink before COPY, otherwise view after the COPY
-  (UPat(Ops.COPY, src=(UPat(Ops.VIEW, name="v"), UPat(Ops.DEVICE)), name="copy"), lambda copy,v: v.contiguous().copy_to_device(copy.device) \
-    if prod(v.shape) < prod(v.base.shape) else v.base.copy_to_device(copy.device).view(v.st)),
+  (UPat(Ops.COPY, src=(UPat(Ops.VIEW, name="v"), UPat(Ops.DEVICE)), name="copy"), lambda copy,v:
+    v.contiguous().copy_to_device(copy.device, arg=copy.arg) if prod(v.shape) < prod(v.base.shape) else \
+    v.base.copy_to_device(copy.device, arg=copy.arg).view(v.st)),
   # remove cast to image when it's already a contiguous image
   (UPat(Ops.CAST, name="cast", src=(UPat(Ops.VIEW, name="vm", src=(UPat(Ops.CONTIGUOUS, name="base"),)),)),
    lambda cast,base,vm: base.view(vm.st) if isinstance(cast.dtype, ImageDType) and isinstance(base.dtype, ImageDType) else None),
@@ -295,9 +296,6 @@ def reduce_push_add_ones(src:UOp, r:UOp, view:UOp):
   return None
 
 view_left = merge_views+PatternMatcher([
-  # do not push masked view before unsafe pad ops
-  (UPat(Ops.VIEW, src=(UPat(GroupOp.UnsafePad, name="e"),), name="view"),
-   lambda e,view: e.contiguous().view(view.st) if any(v.mask is not None for v in view.st.views) else None),
   # view before elementwise ops
   (UPat(Ops.VIEW, src=(UPat({*GroupOp.ALU, Ops.CAST, Ops.BITCAST, Ops.BIND}, name="e"),), name="view"),
    lambda e,view: e.replace(src=tuple(s.view(s.st+view.st) if s.op is Ops.VIEW else s.view(view.st) for s in e.src))),
@@ -308,7 +306,7 @@ view_left = merge_views+PatternMatcher([
 def apply_swizzle(u:UOp) -> UOp: return graph_rewrite(u, view_left, name="Sub View Left")
 
 def swizzle_reduceop(r:UOp, src:UOp, view:UOp, fuse=False):
-  if (st:=unwrap(view.st)).contiguous: return None
+  if (st:=unwrap(view.st)).contiguous and st.size == r.size: return None
   input_st = ShapeTracker.from_shape(src.shape)
   tmp = input_st.permute(tuple(i for i in range(len(input_st.shape)) if i not in r.axis_arg)+r.axis_arg)
   prshape = prod(rshape:=tmp.shape[-len(r.axis_arg):])
@@ -325,7 +323,11 @@ def swizzle_reduceop(r:UOp, src:UOp, view:UOp, fuse=False):
 
 def reduceop_view_right(src:UOp, v:UOp, r:UOp):
   assert unwrap(v.st).contiguous and v.size == src.size, f"can't compute new axis for {src.shape} -> {r.shape}"
-  return src.r(r.arg[0], tuple(i for i,(s,u) in enumerate(zip(src.shape, r.shape)) if resolve(s != u))).view(ShapeTracker.from_shape(r.shape))
+  if (contraction:=get_contraction(v.shape, src.shape)) is None: return None
+  new_axis: list[int] = []
+  for i,pairs in enumerate(contraction):
+    if any(x in r.axis_arg for x in pairs): new_axis.append(i)
+  return src.r(r.arg[0], tuple(new_axis)).reshape(r.shape)
 
 def elementwise_view_right(root:UOp):
   if not (swizzles:=[x for x in root.src if x.op is Ops.VIEW and x.base.op not in ALWAYS_CONTIGUOUS]): return None
@@ -414,7 +416,11 @@ pm_fuse = PatternMatcher([
   (UPat(Ops.REDUCE_AXIS, name="r").fuse(),
    lambda r: r.replace(src=(r.src[0].fuse(),), arg=r.arg+(True,)) if len(r.arg) == 2 else None),
 
-  # FUSE elementwise. TODO: check for PAD
+  # remove FUSE and insert CONTIGUOUS if it's an unsafe pad
+  (UPat(Ops.VIEW, src=(UPat(GroupOp.UnsafePad, name="alu"),), name="view").fuse(),
+   lambda alu, view: alu.contiguous().view(view.st) if any(v.mask is not None for v in view.st.views) else None),
+
+  # FUSE elementwise.
   (UPat(Ops.VIEW, src=(UPat({*GroupOp.ALU, Ops.CAST}, name="alu"),), name="view").fuse(),
    lambda alu, view: alu.replace(src=tuple(x.view(view.arg).fuse() for x in alu.src))),
 
