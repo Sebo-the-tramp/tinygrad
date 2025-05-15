@@ -11,6 +11,8 @@ import torch, pathlib, math, operator, functools, inspect
 torch.autograd.grad_mode.set_multithreading_enabled(False)
 from tinygrad.dtype import _from_torch_dtype, _to_torch_dtype
 
+import numpy as np
+
 # https://pytorch.org/docs/stable/torch.compiler_ir.html
 
 def _from_torch_device(device: torch.device): return f"{Device.DEFAULT}:{device.index or 0}"
@@ -68,10 +70,12 @@ def realize_with_views(self: Tensor, views: Tensor):
   if not self.lazydata.st.contiguous: self.replace(self.contiguous())
   self.replace(self.clone().realize())
   for v in views:
-    if v.lazydata.base.op is Ops.BUFFER_VIEW: continue # skip subbuffer, we just use the real buffer view
-    ret = self
-    st = ShapeTracker(self.lazydata.st.views + v.lazydata.st.views) # TODO: is this right?
-    for mo in cached_to_movement_ops(self.shape, st): ret = apply_mop(ret, mo)
+    if v.shape == ():
+      ret = self.reshape((-1,)).shrink(((o:=v.lazydata.st.views[-1].offset, o+1),)).reshape(())
+    else:
+      ret = self
+      st = ShapeTracker(self.lazydata.st.views + v.lazydata.st.views) # TODO: is this right?
+      for mo in cached_to_movement_ops(self.shape, st): ret = apply_mop(ret, mo)          
     v.replace(ret)
 def maybe_realize_storage(self: Tensor) -> bool:
   if realize:=is_view(self): realize_with_views((base:=canonical_base(self)), derived_views(base))
@@ -110,6 +114,9 @@ def isin_tensor_tensor_out(x, y, *, assume_unique=False, invert=False, out=None)
 @torch.library.impl("aten::randperm.generator_out", "privateuseone")
 def randperm_generator(n, generator=None, out=None):
   return out.copy_(wrap(Tensor.randperm(n, generator=generator, device=unwrap(out).device)))
+  # perm = Tensor.arange(n, device=unwrap(out).device)
+  # perm = wrap(perm[torch.randperm(n)])  # safe shuffle
+  # return out.copy_(perm)
 
 @torch.library.impl("aten::cummax", "privateuseone")
 def cummax(self, dim):
@@ -164,6 +171,19 @@ def cached_to_movement_ops(shape, st) -> list:
 
 from tinygrad.shape.shapetracker import ShapeTracker, View
 from extra.to_movement_ops import to_movement_ops, apply_mop, MovementOps
+# def _as_strided(tensor:Tensor, size, stride, storage_offset=None):
+#   base = canonical_base(tensor)
+#   st = ShapeTracker(base.lazydata.st.views + (View.create(tuple(size), tuple(stride), storage_offset),))
+#   ret = base
+#   if prod(size) == 1: return ret.flatten()[storage_offset].reshape(size)
+#   for mo in cached_to_movement_ops(tuple(base.shape), st): ret = apply_mop(ret, mo)
+#   return ret
+
+# @torch.library.impl("aten::as_strided", "privateuseone")
+# def as_strided(tensor:torch.Tensor, size, stride, storage_offset=None):
+#   storage_offset = storage_offset or tensor.storage_offset()
+#   return wrap(_as_strided(unwrap(tensor), size, stride, storage_offset))
+
 @torch.library.impl("aten::as_strided", "privateuseone")
 def as_strided(tensor:torch.Tensor, size, stride, storage_offset=None):
   storage_offset = storage_offset or tensor.storage_offset()
@@ -265,20 +285,74 @@ def select_backward(grad_out, input_sizes, dim, index):
   return wrap(grad_input)
 
 # START added these functions for hlb-CIFAR10
-@torch.library.impl("aten::unfold", "privateuseone")
-def unfold(x: torch.Tensor, dim: int, size: int=2, step: int=1):
-    x_ = unwrap(x)
-    kernel_ = [size] + [1]*(x_.ndim - dim - 1)
-    stride_  = [step] + [1]*(x_.ndim - dim - 1)
-    y = x_._pool(k_=kernel_, stride=stride_)        # shape: old_dims + out + all kernels
-    idx = [slice(None)]*(x_.ndim + len(kernel_))    # keep old dims and the first kernel axis
-    idx[x_.ndim+1:] = [0]*(len(kernel_)-1)          # drop the 1-sized kernel axes after it
-    return wrap(y[idx]) 
+@torch.library.impl("aten::equal", "privateuseone")
+def equal(self, other): return (st:=unwrap(self)).shape==(ot:=unwrap(other)).shape and st.eq(ot).all().item()
 
 @torch.library.impl("aten::_linalg_eigh", "privateuseone")
-def _linalg_eigh(tensor, UPLO="L"):
-    print(tensor)
-    return None
+def _linalg_eigh(A, UPLO="L", compute_v=True): return tuple(t.to("tiny") for t in aten._linalg_eigh(A.cpu(), UPLO, compute_v))
+
+# @torch.library.impl("aten::_linalg_eigh", "privateuseone")
+# def _linalg_eigh(A, UPLO="L", compute_v=True):  
+
+# @torch.library.impl("aten::_linalg_eigh", "privateuseone")
+# def _linalg_eigh(A, UPLO="L", compute_v=True):  
+#   A = unwrap(A).realize()
+#   print("A NUMEL", A.numel())
+#   print("OK TINYGRAD")
+#   print(f"Tensor shape: {A.shape}, dtype: {A.dtype}, device: {A.device}")
+#   # Try to move to CPU explicitly before numpy conversion  
+#   A_cpu = A.to("CPU").realize()  
+#   print("Moved to CPU")
+#   A_np = A_cpu.numpy()
+#   print("OK CPU")
+#   evals, evecs = np.linalg.eigh(A_np)
+#   return wrap(Tensor(evals).to(A.device)), wrap(Tensor(evecs).to(A.device))
+
+
+
+# @torch.library.impl("aten::_linalg_eigh", "privateuseone")
+# def _linalg_eigh(A, UPLO="L", compute_v=True): 
+#   A_tiny = unwrap(A)
+#   A_tiny.realize()              # forza NV
+#   A_cpu = A_tiny.to("CPU")      
+#   A_cpu.realize()               # forza la copia a CPU
+#   print("OK CPU")
+
+#   buf = A_cpu.lazydata.base.buffer
+#   A_np = np.frombuffer(buf, dtype=np.float32).reshape(A.shape)
+#   print("OK NUMPY")
+
+#   evals, evecs = np.linalg.eigh(A_np)
+#   return wrap(Tensor(evals)), wrap(Tensor(evecs))
+
+# # this needs to be fixed, is not really working
+# @torch.library.impl("aten::unfold", "privateuseone")
+# def unfold(self, d, size, step):
+#   self = unwrap(self)
+
+#   if d < 0: d += self.ndim
+#   assert 0 <= d < self.ndim
+#   assert size <= self.shape[d]
+
+#   idx = [slice(None)] * self.ndim
+#   idx[d] = Tensor.arange(size).unsqueeze(0) + Tensor.arange(0, self.shape[d]-size+step, step).unsqueeze(-1)
+#   ret = self[idx].permute(list(range(d+1)) + list(range(d+2, self.ndim+1)) + [d+1])
+
+#   return wrap(ret)
+
+@torch.library.impl("aten::unfold", "privateuseone")
+def unfold(x: torch.Tensor, dim: int, k: int=2, s: int=1):
+  
+  if dim < 0: dim += x.ndim
+  assert 0 <= dim < x.ndim
+  assert s <= x.shape[dim]
+
+  x_tiny = unwrap(x)
+  res = x_tiny._pool(
+        k_=tuple(k if i == dim else 1 for i in range(x_tiny.ndim)),
+        stride=tuple(s if i == dim else 1 for i in range(x_tiny.ndim))
+    )  
+  return wrap(res.reshape(*res.shape[:x_tiny.ndim], k))
 
 # END added these functions for hlb-CIFAR10
 
@@ -480,7 +554,7 @@ tiny_backend_out = {**{f"aten.{x}.out":getattr(Tensor,x) for x in simple_tensor_
   "aten.expm1.out": lambda self: self.exp() - 1,
   "aten.fmax.out": lambda input,other: Tensor.where(input.isnan() & ~other.isnan(), other, Tensor.where(~input.isnan() & other.isnan(), input, Tensor.maximum(input, other))),
   "aten.fmin.out": lambda input,other: Tensor.where(input.isnan() & ~other.isnan(), other, Tensor.where(~input.isnan() & other.isnan(), input, Tensor.minimum(input, other))),
-  "aten.amax.out": lambda self,dim=None: self.max(axis=dim),
+  "aten.amax.out": lambda self,dim=None: self.max(axis=dim),  
   # TODO: this gets the shape wrong
   #"aten.arange.start_out": Tensor.arange,
   "aten.lerp.Scalar_out": Tensor.lerp,
@@ -524,6 +598,8 @@ tiny_backend = {**{k:wrap_out(v) for k,v in tiny_backend_out.items()}, **{
   "aten.mean.dim": Tensor.mean,
   "aten.min": Tensor.min,
   "aten.max": Tensor.max,
+  "aten.amin": Tensor.min,
+  "aten.amax": Tensor.max,
   "aten.mm": Tensor.matmul,
   "aten.mv": Tensor.matmul,
   "aten.dot": Tensor.dot,
@@ -584,9 +660,6 @@ tiny_backend = {**{k:wrap_out(v) for k,v in tiny_backend_out.items()}, **{
     self.ones_like(**{k: v for k, v in {"dtype": _from_torch_dtype(dtype) if dtype else None,
                                         "device": _from_torch_device(device) if device else None}.items() if v is not None}),
   "aten.max.dim": lambda self, dim, keepdim=False: (self.max(dim, keepdim), self.argmax(dim, keepdim).cast(dtype=dtypes.int64)),
-
-  # new things needed for hlb
-  # "aten.unfold": lambda self, dim: self.unfold(dim)
 }}
 
 def wrap_fxn(k,f):
