@@ -31,7 +31,7 @@ class UnsyncedBatchNorm:
 
     self.running_mean = Tensor.zeros(num_devices, sz, dtype=dtypes.float32, requires_grad=False)
     self.running_var = Tensor.ones(num_devices, sz, dtype=dtypes.float32, requires_grad=False)
-    self.num_batches_tracked = Tensor.zeros(1, dtype=dtypes.int, requires_grad=False)
+    self.num_batches_tracked = Tensor.zeros(1, dtype=dtypes.int32, requires_grad=False)
 
   def __call__(self, x:Tensor):
     xr = x.reshape(self.num_devices, -1, *x.shape[1:]).cast(dtypes.float32)

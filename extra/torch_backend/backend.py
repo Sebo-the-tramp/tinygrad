@@ -20,7 +20,8 @@ def _to_torch_device(device: str): return torch.device("tiny", int(device.partit
 
 import torch.utils.cpp_extension
 mod = torch.utils.cpp_extension.load(name="custom_device_extension", sources=[str(pathlib.Path(__file__).parent / "wrapped_tensor.cpp")])
-def wrap(x:Tensor) -> torch.Tensor: return mod.wrap(x, _to_torch_dtype(x.dtype), _to_torch_device(x.device).index)
+def wrap(x:Tensor) -> torch.Tensor:  
+  return mod.wrap(x, _to_torch_dtype(x.dtype), _to_torch_device(x.device).index)
 def unwrap(x:torch.Tensor) -> Tensor:
   assert isinstance(x, torch.Tensor), f"x isn't {type(x)}"
   return mod.unwrap(x)
@@ -40,7 +41,7 @@ aten = torch.ops.aten
 def is_view(tensor: Tensor): return hasattr(tensor, "_view_base")
 def canonical_base(view: Tensor): return getattr(view, "_view_base", view)
 def derived_views(base: Tensor): return [t for tref in getattr(base, "_views", set()) if (t:=tref()) is not None]
-def wrap_view_op(fn):
+def wrap_view_op(fn):  
   def _wrap(*args,**kwargs):
     args = [unwrap(x) if isinstance(x, torch.Tensor) else x for x in args]
     kwargs = {k:unwrap(v) if isinstance(v, torch.Tensor) else v for k,v in kwargs.items()}
@@ -148,17 +149,18 @@ def index_tensor(x, y):
 @inplace_fn("x")
 def zero_(x):
   if TORCH_DEBUG: print(f"zero_ {x.shape}")
-  tt = unwrap(x)
+  tt = unwrap(x)  
   # NOTE: unconditional contiguous covers if x is contiguous (match it) or if x is view (realize for inplace)
   # TODO: consolidate
-  tt.assign(tt.zeros_like().contiguous())
+  tt.assign(tt.zeros_like().contiguous())  
 
 @torch.library.impl("aten::fill_.Scalar", "privateuseone")
 @inplace_fn("x")
 def fill_scalar(x, y):
-  if TORCH_DEBUG: print(f"fill_.Scalar {x.shape} {y}")
-  tt = unwrap(x)
+  if TORCH_DEBUG: print(f"fill_.Scalar {x.shape, x.dtype} {y}")
+  tt = unwrap(x)  
   tt.assign(tt.full_like(y).contiguous())
+
 
 @torch.library.impl("aten::_local_scalar_dense", "privateuseone")
 def _local_scalar_dense(tensor): return unwrap(tensor).item()
@@ -495,9 +497,11 @@ decomps = [
   # this needs copy_strided
   #aten.lerp,
 ]
+import inspect
+
 for k,v in get_decompositions(decomps).items():
   key = str(k._schema).split("(")[0]
-  if TORCH_DEBUG >= 2: print("register decomp for", k)
+  if TORCH_DEBUG >= 2: print("register decomp for", k, v)
   torch.library.impl(key, "privateuseone")(v)
 
 # NOTE: we should only implement the "out" form, it should be 0 overhead
@@ -523,7 +527,10 @@ simple_tensor_methods = [
 tiny_backend_out = {**{f"aten.{x}.out":getattr(Tensor,x) for x in simple_tensor_methods}, **{
   "aten.add.out": lambda input,other,alpha=1: input+alpha*other,
   "aten.sub.out": lambda input,other,alpha=1: input-alpha*other, # NOTE: this is also needed to handle reverse
+
   "aten.div.out_mode": Tensor.div,
+  # "aten.div.out": lambda a, b: wrap(Tensor.div(*autocast_for_div(a, b))),
+
   "aten.mul.out": operator.mul,
   "aten.bmm.out": operator.matmul,
   # NOTE: because these methods have a name with "Tensor" in them, they can't go in simple tensor methods
@@ -680,9 +687,7 @@ for k,v in tiny_backend.items(): torch.library.impl(k.replace("aten.", "aten::")
 if TORCH_DEBUG:
   from torch.utils._python_dispatch import TorchDispatchMode
   class DispatchLog(TorchDispatchMode):
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-      #print(f"Dispatch Log: {func}(*{args}, **{kwargs})")
-      print(f"Dispatch Log: {func}")
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):            
       return func(*args, **(kwargs or {}))
   (_dispatch_log:=DispatchLog()).__enter__() # NOTE: must be kept alive
 
@@ -690,34 +695,37 @@ if TORCH_DEBUG:
 import weakref
 _torch_modules_with_buffers: weakref.WeakSet[torch.nn.Module] = weakref.WeakSet()
 def register_torch_buffer(mod, _name, _buffer): _torch_modules_with_buffers.add(mod)
-def get_real_tinygrad_buffers():
+def get_real_tinygrad_buffers():  
   res = set()
-  for mod in _torch_modules_with_buffers:
-    for _,b in mod.named_buffers(recurse=False):
-      if b is not None and b.is_tiny:
+  for mod in _torch_modules_with_buffers:    
+    for n,b in mod.named_buffers(recurse=False):
+      if b is not None and b.is_tiny:        
         res.add(unwrap(b))
   return res
 torch.nn.modules.module.register_module_buffer_registration_hook(register_torch_buffer)
 
 from torch.nn.modules import Module
 def backward_hook(model:Module, _grad_input, _grad_out):
-  grads_to_realize = [unwrap(p.grad) for p in model.parameters() if p.grad is not None]
-  if len(grads_to_realize): Tensor.realize(*grads_to_realize)
-def module_hook(module:Module, _name, _submodule): module.register_backward_hook(backward_hook)
+  grads_to_realize = [unwrap(p.grad) for p in model.parameters() if p.grad is not None]   
+  for x in grads_to_realize:    
+    Tensor.realize(x)    
+  if len(grads_to_realize): Tensor.realize(*grads_to_realize)  
+
+def module_hook(module:Module, _name, _submodule): module.register_full_backward_hook(backward_hook)
 torch.nn.modules.module.register_module_module_registration_hook(module_hook)
 
 def realize_optimizer_step(optimizer: torch.optim.Optimizer, *args, **kwargs):
-  tinygrad_tensors = []
-  for param_group in optimizer.param_groups:
-    for param in param_group["params"]:
+  tinygrad_tensors = []  
+  for param_group in optimizer.param_groups:    
+    for param in param_group["params"]:      
       if param is None: continue
       tinygrad_tensors.append(param.data)
   for state_dict in optimizer.state.values():
-    for _, value in state_dict.items():
-      if torch.is_tensor(value): tinygrad_tensors.append(value)
-  real_tinygrad_tensors = [unwrap(x) for x in tinygrad_tensors if x.is_tiny]
-  real_tinygrad_tensors += get_real_tinygrad_buffers()
-  if len(real_tinygrad_tensors): Tensor.realize(*real_tinygrad_tensors)
+    for x, value in state_dict.items():      
+      if torch.is_tensor(value): tinygrad_tensors.append(value)      
+  real_tinygrad_tensors = [unwrap(x) for x in tinygrad_tensors if x.is_tiny]  
+  real_tinygrad_tensors += get_real_tinygrad_buffers()  
+  if len(real_tinygrad_tensors): Tensor.realize(*real_tinygrad_tensors)  
 
 _optimizer_init = torch.optim.Optimizer.__init__
 def _optimizer_patched_init(self, *args, **kwargs):

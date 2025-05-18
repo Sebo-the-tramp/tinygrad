@@ -37,7 +37,9 @@ class BatchNorm:
     self.weight: Tensor|None = Tensor.ones(sz) if affine else None
     self.bias: Tensor|None = Tensor.zeros(sz) if affine else None
 
-    self.num_batches_tracked = Tensor.zeros(1, dtype='long' if is_dtype_supported(dtypes.long) else 'int', requires_grad=False)
+    self.num_batches_tracked = Tensor.zeros(1, dtype='long' if is_dtype_supported(dtypes.long) else 'int32', requires_grad=False)
+    # self.num_batches_tracked = Tensor.zeros(1, dtype=dtypes.int32, requires_grad=False)
+    print("HELLOOOOO", self.num_batches_tracked.dtype, self.num_batches_tracked.device)
     if track_running_stats: self.running_mean, self.running_var = Tensor.zeros(sz, requires_grad=False), Tensor.ones(sz, requires_grad=False)
 
   def calc_stats(self, x:Tensor) -> tuple[Tensor, Tensor]:
@@ -54,6 +56,7 @@ class BatchNorm:
   def __call__(self, x:Tensor) -> Tensor:
     batch_mean, batch_var = self.calc_stats(x)
     # NOTE: wow, this is done all throughout training in most PyTorch models
+    print("CIAOO schifo")
     if self.track_running_stats and Tensor.training:
       self.running_mean.assign((1-self.momentum) * self.running_mean + self.momentum * batch_mean.detach())
       self.running_var.assign((1-self.momentum) * self.running_var + self.momentum * x.numel()/(x.numel()-x.shape[1]) * batch_var.detach())
